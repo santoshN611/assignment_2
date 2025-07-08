@@ -1,39 +1,26 @@
-// lib/main.dart
-
 import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:path/path.dart' as Path;
-import 'package:sqflite/sqflite.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:cross_file/cross_file.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:sqflite/sqflite.dart'; // ← restored!
 
-void main() => runApp(const MainApp());
+void main() {
+  runApp(const MainApp());
+}
 
 class MainApp extends StatelessWidget {
   const MainApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'GT IMU Recorder',
-      theme: ThemeData(
-        colorScheme: const ColorScheme.light(
-          primary: Color(0xFF003057), // GT Navy
-          secondary: Color(0xFFFFC72C), // GT Old Gold
-        ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF003057),
-          foregroundColor: Color(0xFFFFC72C),
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: const Color(0xFFFFC72C),
-            foregroundColor: Colors.black,
-          ),
-        ),
-      ),
+      title: 'IMU Data Recording',
+      theme: ThemeData(),
       home: const MyHomePage(),
     );
   }
@@ -41,222 +28,173 @@ class MainApp extends StatelessWidget {
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key});
+
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  bool recording = false;
-  late DatabaseHelper _dbHelper;
+  bool _recording = false;
 
-  StreamSubscription<UserAccelerometerEvent>? _userAccSub;
-  StreamSubscription<AccelerometerEvent>? _accSub;
-  StreamSubscription<GyroscopeEvent>? _gyroSub;
-  StreamSubscription<MagnetometerEvent>? _magSub;
+  UserAccelerometerEvent? _userAcc;
+  AccelerometerEvent? _acc;
+  GyroscopeEvent? _gyro;
+  MagnetometerEvent? _mag;
 
-  UserAccelerometerEvent? _lastUserAcc;
-  AccelerometerEvent? _lastAcc;
-  GyroscopeEvent? _lastGyro;
-  MagnetometerEvent? _lastMag;
+  late final StreamSubscription<UserAccelerometerEvent> _userAccSub;
+  late final StreamSubscription<AccelerometerEvent> _accSub;
+  late final StreamSubscription<GyroscopeEvent> _gyroSub;
+  late final StreamSubscription<MagnetometerEvent> _magSub;
+
+  Timer? _ticker;
+  IOSink? _sink;
+  File? _csvFile;
 
   @override
   void initState() {
     super.initState();
-    _dbHelper = DatabaseHelper.instance;
+    _userAccSub = userAccelerometerEvents.listen((e) => _userAcc = e);
+    _accSub = accelerometerEvents.listen((e) => _acc = e);
+    _gyroSub = gyroscopeEvents.listen((e) => _gyro = e);
+    _magSub = magnetometerEvents.listen((e) => _mag = e);
+  }
+
+  Future<void> startRecording() async {
+    final dir = await getTemporaryDirectory();
+    _csvFile = File(Path.join(dir.path, 'imu_data.csv'));
+    final exists = await _csvFile!.exists();
+    if (exists) {
+      await _csvFile!.delete();
+    }
+
+    _sink = _csvFile!.openWrite(mode: FileMode.write);
+    if (!exists) {
+      _sink!.writeln(
+        [
+          'timestamp',
+          'user_x',
+          'user_y',
+          'user_z',
+          'acc_x',
+          'acc_y',
+          'acc_z',
+          'gyro_x',
+          'gyro_y',
+          'gyro_z',
+          'mag_x',
+          'mag_y',
+          'mag_z',
+        ].join(','),
+      );
+    }
+
+    setState(() => _recording = true);
+
+    _ticker = Timer.periodic(const Duration(milliseconds: 200), (_) {
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      final row = [
+        ts,
+        _userAcc?.x.toStringAsFixed(3) ?? '',
+        _userAcc?.y.toStringAsFixed(3) ?? '',
+        _userAcc?.z.toStringAsFixed(3) ?? '',
+        _acc?.x.toStringAsFixed(3) ?? '',
+        _acc?.y.toStringAsFixed(3) ?? '',
+        _acc?.z.toStringAsFixed(3) ?? '',
+        _gyro?.x.toStringAsFixed(3) ?? '',
+        _gyro?.y.toStringAsFixed(3) ?? '',
+        _gyro?.z.toStringAsFixed(3) ?? '',
+        _mag?.x.toStringAsFixed(3) ?? '',
+        _mag?.y.toStringAsFixed(3) ?? '',
+        _mag?.z.toStringAsFixed(3) ?? '',
+      ].join(',');
+      _sink!.writeln(row);
+      setState(() {}); // refresh UI
+    });
+  }
+
+  Future<void> stopRecording() async {
+    _ticker?.cancel();
+    _ticker = null;
+
+    if (_sink != null) {
+      await _sink!.close();
+      _sink = null;
+    }
+
+    setState(() => _recording = false);
+
+    if (_csvFile != null && await _csvFile!.exists()) {
+      await Share.shareXFiles([
+        XFile(_csvFile!.path),
+      ], text: 'Here is my IMU data log');
+    }
   }
 
   @override
   void dispose() {
-    _stopRecording();
+    _userAccSub.cancel();
+    _accSub.cancel();
+    _gyroSub.cancel();
+    _magSub.cancel();
+    _ticker?.cancel();
+    _sink?.close();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext ctx) {
+  Widget build(BuildContext context) {
+    Widget buildRow(String label, double? x, double? y, double? z) {
+      final text = (x == null)
+          ? '…'
+          : '${x.toStringAsFixed(3)}, '
+                '${y!.toStringAsFixed(3)}, '
+                '${z!.toStringAsFixed(3)}';
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+        child: Row(
+          children: [
+            Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(width: 8),
+            Expanded(child: Text(text)),
+          ],
+        ),
+      );
+    }
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('IMU Data Recording'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.share),
-            onPressed: () async {
-              try {
-                await _dbHelper.exportDatabase();
-              } catch (e) {
-                ScaffoldMessenger.of(
-                  ctx,
-                ).showSnackBar(SnackBar(content: Text('Export failed: $e')));
-              }
-            },
+      appBar: AppBar(title: const Text('IMU Data Recording')),
+      body: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          buildRow('User Accelerometer', _userAcc?.x, _userAcc?.y, _userAcc?.z),
+          buildRow('Accelerometer', _acc?.x, _acc?.y, _acc?.z),
+          buildRow('Gyroscope', _gyro?.x, _gyro?.y, _gyro?.z),
+          buildRow('Magnetometer', _mag?.x, _mag?.y, _mag?.z),
+          const SizedBox(height: 24),
+          ElevatedButton(
+            onPressed: _recording ? stopRecording : startRecording,
+            child: Text(_recording ? 'Stop & Share' : 'Start Recording'),
           ),
         ],
       ),
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(recording ? 'Recording…' : 'Not recording'),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: recording ? _stopRecording : _startRecording,
-              child: Text(recording ? 'Stop' : 'Start'),
-            ),
-          ],
-        ),
-      ),
     );
-  }
-
-  void _startRecording() {
-    _stopRecording();
-    _userAccSub = userAccelerometerEvents.listen((e) {
-      _lastUserAcc = e;
-      _maybeSave();
-    });
-    _accSub = accelerometerEvents.listen((e) {
-      _lastAcc = e;
-      _maybeSave();
-    });
-    _gyroSub = gyroscopeEvents.listen((e) {
-      _lastGyro = e;
-      _maybeSave();
-    });
-    _magSub = magnetometerEvents.listen((e) {
-      _lastMag = e;
-      _maybeSave();
-    });
-    setState(() => recording = true);
-  }
-
-  void _stopRecording() {
-    for (var sub in [_userAccSub, _accSub, _gyroSub, _magSub]) {
-      sub?.cancel();
-    }
-    _userAccSub = _accSub = _gyroSub = _magSub = null;
-    setState(() => recording = false);
-  }
-
-  void _maybeSave() {
-    if (_lastUserAcc == null ||
-        _lastAcc == null ||
-        _lastGyro == null ||
-        _lastMag == null)
-      return;
-
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final data = ImuData(
-      timestamp: now,
-      user_acc_x: _lastUserAcc!.x,
-      user_acc_y: _lastUserAcc!.y,
-      user_acc_z: _lastUserAcc!.z,
-      acc_x: _lastAcc!.x,
-      acc_y: _lastAcc!.y,
-      acc_z: _lastAcc!.z,
-      gyro_x: _lastGyro!.x,
-      gyro_y: _lastGyro!.y,
-      gyro_z: _lastGyro!.z,
-      mag_x: _lastMag!.x,
-      mag_y: _lastMag!.y,
-      mag_z: _lastMag!.z,
-    );
-    _dbHelper.insertImu(data);
   }
 }
 
 class ImuData {
-  final int timestamp;
-  final double user_acc_x, user_acc_y, user_acc_z;
-  final double acc_x, acc_y, acc_z;
-  final double gyro_x, gyro_y, gyro_z;
-  final double mag_x, mag_y, mag_z;
-
-  ImuData({
-    required this.timestamp,
-    required this.user_acc_x,
-    required this.user_acc_y,
-    required this.user_acc_z,
-    required this.acc_x,
-    required this.acc_y,
-    required this.acc_z,
-    required this.gyro_x,
-    required this.gyro_y,
-    required this.gyro_z,
-    required this.mag_x,
-    required this.mag_y,
-    required this.mag_z,
-  });
-
-  Map<String, dynamic> toMap() => {
-    'timestamp': timestamp,
-    'user_acc_x': user_acc_x,
-    'user_acc_y': user_acc_y,
-    'user_acc_z': user_acc_z,
-    'accelerometer_x': acc_x,
-    'accelerometer_y': acc_y,
-    'accelerometer_z': acc_z,
-    'gyroscope_x': gyro_x,
-    'gyroscope_y': gyro_y,
-    'gyroscope_z': gyro_z,
-    'magnetometer_x': mag_x,
-    'magnetometer_y': mag_y,
-    'magnetometer_z': mag_z,
-  };
+  ImuData();
+  Map<String, Object?> toMap() => {};
 }
 
 class DatabaseHelper {
-  static final DatabaseHelper instance = DatabaseHelper._init();
-  static Database? _db;
-  DatabaseHelper._init();
+  DatabaseHelper._privateConstructor();
+  static final DatabaseHelper instance = DatabaseHelper._privateConstructor();
 
-  Future<Database> get database async {
-    if (_db != null) return _db!;
-    _db = await _initDB();
-    return _db!;
-  }
-
-  Future<Database> _initDB() async {
-    final docs = await getApplicationDocumentsDirectory();
-    final path = Path.join(docs.path, 'imu_data.db');
-    return await openDatabase(path, version: 1, onCreate: _onCreate);
-  }
-
-  Future _onCreate(Database db, int version) async {
-    await db.execute('''
-      CREATE TABLE imu_data (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp         INTEGER,
-        user_acc_x        REAL,
-        user_acc_y        REAL,
-        user_acc_z        REAL,
-        accelerometer_x   REAL,
-        accelerometer_y   REAL,
-        accelerometer_z   REAL,
-        gyroscope_x       REAL,
-        gyroscope_y       REAL,
-        gyroscope_z       REAL,
-        magnetometer_x    REAL,
-        magnetometer_y    REAL,
-        magnetometer_z    REAL
-      )
-    ''');
-  }
-
-  Future<void> insertImu(ImuData d) async {
-    final db = await database;
-    await db.insert(
-      'imu_data',
-      d.toMap(),
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
-
-  Future<void> exportDatabase() async {
-    final db = await database;
-    final path = db.path;
-    final file = File(path);
-    if (!await file.exists()) {
-      throw Exception('DB not found at $path');
-    }
-    await Share.shareXFiles([XFile(path)], text: 'IMU Data (GT Recorder)');
-  }
+  Future<Database> get database async => throw UnimplementedError();
+  Future _initDatabase() async => throw UnimplementedError();
+  Future _onCreate(Database db, int version) async =>
+      throw UnimplementedError();
+  Future<void> insertImuData(ImuData imuData) async =>
+      throw UnimplementedError();
+  Future<void> exportDatabase() async => throw UnimplementedError();
 }
